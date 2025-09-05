@@ -1,4 +1,9 @@
 # coding=utf-8
+
+# Copyright (C) 2022. Huawei Technologies Co., Ltd. All rights reserved.
+# Changes made to the original code:
+# 2022.08.20 - Changed the RoBerta model to support DyLoRA
+
 # Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
 # Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -187,6 +192,18 @@ class RobertaSelfAttention(nn.Module):
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
+    def set_rank(self, rank):
+        self.query.set_rank(rank)
+        self.value.set_rank(rank)
+
+    def get_dimension(self):
+        assert self.query.get_dimension() == self.value.get_dimension()
+        return self.query.get_dimension()
+
+    def get_rank(self):
+        assert self.query.get_rank() == self.value.get_rank()
+        return self.query.get_rank()
+
     def forward(
         self,
         hidden_states,
@@ -309,6 +326,15 @@ class RobertaAttention(nn.Module):
         self.output = RobertaSelfOutput(config)
         self.pruned_heads = set()
 
+    def set_rank(self, rank):
+        self.self.set_rank(rank)
+
+    def get_dimension(self):
+        return self.self.get_dimension()
+
+    def get_rank(self):
+        return self.self.get_rank()
+
     def prune_heads(self, heads):
         if len(heads) == 0:
             return
@@ -405,6 +431,22 @@ class RobertaLayer(nn.Module):
         self.intermediate = RobertaIntermediate(config)
         self.output = RobertaOutput(config)
 
+    def set_rank(self, rank):
+        self.attention.set_rank(rank)
+        if self.add_cross_attention:
+            self.crossattention.set_rank(rank)
+
+    def get_dimension(self):
+        if self.add_cross_attention:
+            return self.cross_attention.get_dimension()
+        return self.attention.get_dimension()
+
+
+    def get_rank(self):
+        if self.add_cross_attention:
+            return self.cross_attention.get_rank()
+        return self.attention.get_rank()
+
     def forward(
         self,
         hidden_states,
@@ -481,6 +523,18 @@ class RobertaEncoder(nn.Module):
         self.config = config
         self.layer = nn.ModuleList([RobertaLayer(config) for _ in range(config.num_hidden_layers)])
 
+    def set_rank(self, rank):
+        for layer in self.layer:
+            layer.set_rank(rank)
+
+    def get_dimension(self):
+        for layer in self.layer:
+            return layer.get_dimension()
+
+    def get_rank(self):
+        for layer in self.layer:
+            return layer.get_rank()
+    
     def forward(
         self,
         hidden_states,
@@ -747,6 +801,15 @@ class RobertaModel(RobertaPreTrainedModel):
         self.pooler = RobertaPooler(config) if add_pooling_layer else None
 
         self.init_weights()
+
+    def set_rank(self, rank):
+        self.encoder.set_rank(rank)
+
+    def get_dimension(self):
+        return self.encoder.get_dimension()
+
+    def get_rank(self):
+        return self.encoder.get_rank()
 
     def get_input_embeddings(self):
         return self.embeddings.word_embeddings
@@ -1174,6 +1237,15 @@ class RobertaForSequenceClassification(RobertaPreTrainedModel):
         self.classifier = RobertaClassificationHead(config)
 
         self.init_weights()
+
+    def set_rank(self, rank):
+        self.roberta.set_rank(rank)
+
+    def get_dimension(self):
+        return self.roberta.get_dimension()
+
+    def get_rank(self):
+        return self.roberta.get_rank()
 
     @add_start_docstrings_to_model_forward(ROBERTA_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(

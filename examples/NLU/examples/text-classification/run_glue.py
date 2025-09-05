@@ -1,5 +1,11 @@
 #!/usr/bin/env python
 # coding=utf-8
+
+# Copyright (C) 2022. Huawei Technologies Co., Ltd. All rights reserved.
+# Changes made to the original code:
+# 2022.08.20 - Changed the training scheme - adding the DyLoRA scheme
+# 2022.08.20 - Dynamic evaluation for all the possible ranks in LoRA matrices
+
 # Copyright 2020 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +28,7 @@ import random
 import sys
 import torch
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List, Union
 
 import numpy as np
 from datasets import load_dataset, load_metric
@@ -43,6 +49,7 @@ from transformers import (
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
+import math
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -216,6 +223,23 @@ class ModelArguments:
     masking_prob: Optional[float] = field(
         default=0.0,
         metadata={"help": "Token Masking Probability"},
+    )
+
+    # Matryoshka-style nested training controls
+    nested_ranks: Optional[Union[List[int], int]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Nested ranks for Matryoshka training. Provide a list of ranks (e.g. 8 4 2 1) or a single int"
+                " interpreted as the number of levels to generate via powers-of-two downscaling from max_rank."
+            )
+        },
+    )
+    relative_importance: Optional[List[float]] = field(
+        default=None,
+        metadata={
+            "help": "Optional per-rank weights aligned with nested_ranks. If omitted, uniform averaging is used.",
+        },
     )
 
     
@@ -533,8 +557,77 @@ def main():
     else:
         data_collator = None
 
-    # Initialize our Trainer
-    trainer = Trainer(
+    # class callback_step(transformers.TrainerCallback):
+
+    #     def on_step_begin(self, args, state, control, model, **kwargs):
+
+    #         maximum_rank = model.get_dimension()
+
+    #         # current_rank = model.get_rank()
+
+    #         # randomly select a rank
+    #         new_rank = torch.randint(0,maximum_rank,(1,)).item()
+    #         model.set_rank(new_rank)
+
+    # MatryoshkaTrainer: subclass with internal _build_nested_ranks and custom compute_loss
+    class MatryoshkaTrainer(Trainer):
+        @staticmethod
+        def _build_nested_ranks(max_rank: int, nested_ranks: int) -> List[int]:
+            if nested_ranks == -1:
+                # Full chain down to 1, assuming max_rank is a power of 2
+                levels = int(math.log2(max_rank)) + 1
+                return [max_rank // (2 ** i) for i in range(levels)]
+            else:
+                # Fixed number of nested levels
+                return [max_rank // (2 ** i) for i in range(nested_ranks)]
+
+        def __init__(self, *args, nested_ranks: Optional[Union[List[int], int]] = None, rel_importance: Optional[List[float]] = None, **kwargs):
+            super().__init__(*args, **kwargs)
+            try:
+                max_rank = int(self.model.get_dimension())
+            except Exception as e:
+                raise ValueError("Model must implement get_dimension() for Matryoshka training.") from e
+
+            # Build explicit ranks list from arg
+            if nested_ranks is None:
+                nested_ranks = [max_rank]
+            elif isinstance(nested_ranks, int):
+                nested_ranks = MatryoshkaTrainer._build_nested_ranks(max_rank, nested_ranks)
+            else:
+                nested_ranks = nested_ranks
+
+            # Prepare weights (normalized later per-dtype)
+            self.rel_importance = rel_importance
+
+        def compute_loss(self, model, inputs, return_outputs=False):
+            # Default behavior for eval/predict
+            if not model.training or self.ranks_list is None:
+                return super().compute_loss(model, inputs, return_outputs)
+
+            losses = []
+
+            # Remaining forwards
+            for r in self.ranks_list[1:]:
+                model.set_rank(int(r))
+                output = model(**inputs)
+                loss = output["loss"] if isinstance(output, dict) else output.loss
+                losses.append(loss)
+
+            losses = torch.stack(losses)
+            if self.rel_importance is not None:
+                if len(self.rel_importance) != len(losses):
+                    raise ValueError("Expected len(rel_importance) == {}, got {}".format(len(losses), len(self.rel_importance)))
+                loss = (losses * torch.tensor(self.rel_importance, device=losses.device)).sum() / sum(self.rel_importance)
+            else:
+                loss = losses.mean()
+
+            if return_outputs:
+                return loss, output # last output
+            return loss
+
+    # Initialize Trainer (use MatryoshkaTrainer when nested_ranks is provided)
+    trainer_cls = MatryoshkaTrainer if model_args.nested_ranks is not None else Trainer
+    trainer = trainer_cls(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
@@ -542,7 +635,14 @@ def main():
         compute_metrics=compute_metrics,
         tokenizer=tokenizer,
         data_collator=data_collator,
+        # Pass args only used by MatryoshkaTrainer; Trainer will ignore extras via kwargs error, so gate by cls
+        **({
+            'nested_ranks': model_args.nested_ranks,
+            'rel_importance': model_args.relative_importance,
+        } if trainer_cls is MatryoshkaTrainer else {})
     )
+
+    # trainer.add_callback(callback_step)
 
     # Training
     if training_args.do_train:
@@ -580,13 +680,16 @@ def main():
             eval_datasets.append(datasets["validation_mismatched"])
 
         for eval_dataset, task in zip(eval_datasets, tasks):
-            metrics = trainer.evaluate(eval_dataset=eval_dataset)
+            for rank in range(0,model_args.lora_r):
+                print(f'--> eval rank={rank}')
+                trainer.model.set_rank(rank=rank) # set the test rank
+                metrics = trainer.evaluate(eval_dataset=eval_dataset)
 
-            max_val_samples = data_args.max_val_samples if data_args.max_val_samples is not None else len(eval_dataset)
-            metrics["eval_samples"] = min(max_val_samples, len(eval_dataset))
+                max_val_samples = data_args.max_val_samples if data_args.max_val_samples is not None else len(eval_dataset)
+                metrics[f"eval_samples_r{rank}"] = min(max_val_samples, len(eval_dataset))
 
-            trainer.log_metrics("eval", metrics)
-            trainer.save_metrics("eval", metrics)
+                trainer.log_metrics(f"eval_r{rank}", metrics)
+                trainer.save_metrics(f"eval_r{rank}", metrics)
 
     if training_args.do_predict:
         logger.info("*** Test ***")
@@ -599,22 +702,24 @@ def main():
             test_datasets.append(datasets["test_mismatched"])
 
         for test_dataset, task in zip(test_datasets, tasks):
-            # Removing the `label` columns because it contains -1 and Trainer won't like that.
             test_dataset.remove_columns_("label")
-            predictions = trainer.predict(test_dataset=test_dataset).predictions
-            predictions = np.squeeze(predictions) if is_regression else np.argmax(predictions, axis=1)
+            # Removing the `label` columns because it contains -1 and Trainer won't like that.
+            for rank in range(0,model_args.lora_r):
+                print(f'--> test rank={rank}')
+                predictions = trainer.predict(test_dataset=test_dataset).predictions
+                predictions = np.squeeze(predictions) if is_regression else np.argmax(predictions, axis=1)
 
-            output_test_file = os.path.join(training_args.output_dir, f"test_results_{task}.txt")
-            if trainer.is_world_process_zero():
-                with open(output_test_file, "w") as writer:
-                    logger.info(f"***** Test results {task} *****")
-                    writer.write("index\tprediction\n")
-                    for index, item in enumerate(predictions):
-                        if is_regression:
-                            writer.write(f"{index}\t{item:3.3f}\n")
-                        else:
-                            item = label_list[item]
-                            writer.write(f"{index}\t{item}\n")
+                output_test_file = os.path.join(training_args.output_dir, f"test_results_{task}_r{rank}.txt")
+                if trainer.is_world_process_zero():
+                    with open(output_test_file, "w") as writer:
+                        logger.info(f"***** Test results {task} r{rank} *****")
+                        writer.write("index\tprediction\n")
+                        for index, item in enumerate(predictions):
+                            if is_regression:
+                                writer.write(f"{index}\t{item:3.3f}\n")
+                            else:
+                                item = label_list[item]
+                                writer.write(f"{index}\t{item}\n")
 
 
 def _mp_fn(index):
